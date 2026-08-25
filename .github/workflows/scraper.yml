@@ -1,4 +1,4 @@
-name: LinkedIn Cookie-Free Scraper
+name: LinkedIn Scraper
 
 on:
   workflow_dispatch:
@@ -6,7 +6,7 @@ on:
       target_ids:
         description: 'Enter LinkedIn IDs or URLs (e.g. company/tigihr, in/iamrohanpatel)'
         required: true
-        default: 'company/tigihr, in/iamrohanpatel, in/satyanadella'
+        default: 'company/tigihr, in/iamrohanpatel'
         type: string
 
 jobs:
@@ -42,6 +42,7 @@ jobs:
       - name: Run Scraper
         env:
           TARGET_INPUT: ${{ github.event.inputs.target_ids }}
+          SCRAPER_API_KEY: ${{ secrets.SCRAPER_API_KEY }}
         run: |
           python scraper.py
 
