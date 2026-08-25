@@ -3,10 +3,8 @@ import re
 import sys
 import json
 import time
-import requests
 import urllib.parse
 from pathlib import Path
-from bs4 import BeautifulSoup
 
 try:
     from ddgs import DDGS
@@ -16,7 +14,6 @@ except ImportError:
 OUTPUT_DIR = Path("output")
 OUTPUT_DIR.mkdir(exist_ok=True)
 STEP_SUMMARY_FILE = os.environ.get("GITHUB_STEP_SUMMARY")
-SCRAPER_API_KEY = os.environ.get("SCRAPER_API_KEY", "").strip()
 
 def write_to_summary(markdown_text: str):
     if STEP_SUMMARY_FILE:
@@ -24,9 +21,9 @@ def write_to_summary(markdown_text: str):
             f.write(markdown_text + "\n\n")
 
 def normalize_target(target: str) -> tuple[str, str, str]:
-    """Clean input to (type, clean_id, full_url)"""
+    """Cleans input into (type, clean_id, full_url)"""
     target = target.strip()
-    if target.startswith("n/"):  # Fix typo if user entered 'n/username'
+    if target.startswith("n/"):
         target = "in/" + target[2:]
         
     if "linkedin.com/company/" in target:
@@ -62,132 +59,158 @@ def get_targets() -> list[tuple[str, str, str]]:
         tokens = [t for t in re.split(r"[,\n]+", env_targets) if t.strip()]
         return [normalize_target(t) for t in tokens]
     
-    return [normalize_target("company/tigihr")]
+    return [normalize_target("in/satyanadella"), normalize_target("company/tigihr")]
 
 # ----------------------------------------------------------------------
-# FULL PROFILE HTML PARSER
+# HELPER: AUTO-RESOLVE COMPANY LINKEDIN URL
 # ----------------------------------------------------------------------
-def parse_full_profile_html(html_content: str, clean_id: str, linkedin_url: str) -> dict:
-    soup = BeautifulSoup(html_content, "html.parser")
+def resolve_company_url(ddgs: DDGS, company_name: str) -> dict:
+    """Searches for the official LinkedIn Company URL for any extracted company name."""
+    if not company_name or company_name.lower() in ["confidential", "self-employed", "freelance", "n/a", "unknown"]:
+        return {"name": company_name, "company_linkedin_url": None}
     
-    data = {
+    # Strip common suffixes like 'Inc', 'LLC', etc. for search
+    clean_search = re.sub(r"\s+(?:Inc\.?|LLC|Pvt\.?\s*Ltd\.?|Ltd\.?)$", "", company_name, flags=re.IGNORECASE).strip()
+    query = f'site:linkedin.com/company "{clean_search}"'
+    
+    try:
+        results = list(ddgs.text(query, max_results=2))
+        for res in results:
+            href = res.get("href", "")
+            if "linkedin.com/company/" in href:
+                return {
+                    "name": company_name,
+                    "company_linkedin_url": href
+                }
+    except Exception:
+        pass
+    
+    return {"name": company_name, "company_linkedin_url": None}
+
+# ----------------------------------------------------------------------
+# 1. PROFILE SCRAPER (Multi-Query Deep Raw Search + Auto-Company Resolver)
+# ----------------------------------------------------------------------
+def scrape_profile(clean_id: str, linkedin_url: str, slug: str) -> dict:
+    print(f"[*] Gathering complete raw data & companies for: {clean_id}...")
+    
+    profile_data = {
         "id": clean_id,
         "type": "profile",
         "url": linkedin_url,
-        "name": "",
+        "name": clean_id,
         "headline": "",
+        "current_company": None,
+        "past_companies": [],
+        "educations": [],
         "location": "",
-        "about": "",
-        "experiences": [],
-        "educations": []
+        "connections": "",
+        "about_snippet": "",
+        "raw_search_hits": []
     }
 
-    # Extract Name & Headline
-    h1 = soup.find("h1")
-    if h1:
-        data["name"] = h1.get_text(strip=True)
-    
-    headline_el = soup.find(class_=re.compile(r"top-card-layout__headline|text-body-medium"))
-    if headline_el:
-        data["headline"] = headline_el.get_text(strip=True)
+    ddgs = DDGS()
+    queries = [
+        f"site:linkedin.com/in/{clean_id}",
+        f'"{clean_id}" site:linkedin.com/in',
+        f"{clean_id} linkedin Experience Education"
+    ]
 
-    loc_el = soup.find(class_=re.compile(r"top-card-layout__first-subline|text-body-small"))
-    if loc_el:
-        data["location"] = loc_el.get_text(strip=True)
+    all_snippets = []
+    detected_companies = []
 
-    # Extract About Section
-    about_sec = soup.find("section", {"data-test-id": "about-us"}) or soup.find(class_=re.compile(r"summary|about"))
-    if about_sec:
-        data["about"] = about_sec.get_text(separator="\n", strip=True)
-
-    # Extract Experience List
-    exp_sections = soup.find_all(class_=re.compile(r"experience-item|profile-section-card"))
-    for item in exp_sections:
-        title_el = item.find(class_=re.compile(r"title|profile-section-card__title"))
-        comp_el = item.find(class_=re.compile(r"subtitle|profile-section-card__subtitle"))
-        dates_el = item.find(class_=re.compile(r"date-range|caption"))
-        
-        if title_el or comp_el:
-            data["experiences"].append({
-                "title": title_el.get_text(strip=True) if title_el else "",
-                "company": comp_el.get_text(strip=True) if comp_el else "",
-                "duration": dates_el.get_text(strip=True) if dates_el else ""
-            })
-
-    return data
-
-# ----------------------------------------------------------------------
-# PROFILE SCRAPER CONTROLLER
-# ----------------------------------------------------------------------
-def scrape_profile(clean_id: str, linkedin_url: str, slug: str):
-    profile_data = None
-
-    # Method 1: If Scraping Proxy is provided in GitHub Secrets
-    if SCRAPER_API_KEY:
-        print(f"[*] Fetching Full HTML via Scraping Proxy for: {clean_id}...")
-        proxy_url = f"http://api.scraperapi.com?api_key={SCRAPER_API_KEY}&url={urllib.parse.quote(linkedin_url)}"
+    for q in queries:
         try:
-            res = requests.get(proxy_url, timeout=60)
-            if res.status_code == 200 and len(res.text) > 2000:
-                profile_data = parse_full_profile_html(res.text, clean_id, linkedin_url)
-                (OUTPUT_DIR / f"{slug}_raw.html").write_text(res.text, encoding="utf-8")
-        except Exception as e:
-            print(f"    [!] Proxy scrape failed: {e}")
-
-    # Method 2: Search Index Fallback (if no proxy key)
-    if not profile_data or not profile_data.get("name"):
-        print(f"[*] Extracting profile via Search Engine Index for: {clean_id}...")
-        profile_data = {
-            "id": clean_id,
-            "type": "profile",
-            "url": linkedin_url,
-            "name": clean_id,
-            "headline": "",
-            "location": "",
-            "experiences": [],
-            "educations": [],
-            "summary": ""
-        }
-        try:
-            ddgs = DDGS()
-            results = list(ddgs.text(f"site:linkedin.com/in/{clean_id}", max_results=5))
+            results = list(ddgs.text(q, max_results=3))
             for res in results:
-                if "linkedin.com/in/" in res.get("href", ""):
-                    title = res.get("title", "").replace(" | LinkedIn", "").strip()
-                    snippet = res.get("body", "")
+                href = res.get("href", "")
+                if "linkedin.com/in/" in href or clean_id in href:
+                    profile_data["raw_search_hits"].append({
+                        "query": q,
+                        "title": res.get("title", ""),
+                        "url": href,
+                        "snippet": res.get("body", "")
+                    })
+                    all_snippets.append(res.get("body", ""))
                     
-                    if " - " in title:
-                        parts = [p.strip() for p in title.split(" - ") if p.strip()]
+                    # Parse Title
+                    raw_title = res.get("title", "").replace(" | LinkedIn", "").replace(" - LinkedIn", "").strip()
+                    if " - " in raw_title and not profile_data["headline"]:
+                        parts = [p.strip() for p in raw_title.split(" - ") if p.strip()]
                         profile_data["name"] = parts[0]
                         profile_data["headline"] = " - ".join(parts[1:])
-                    else:
-                        profile_data["name"] = title
+                        if len(parts) >= 3:
+                            detected_companies.append(parts[-1])
+                    elif raw_title and profile_data["name"] == clean_id:
+                        profile_data["name"] = raw_title
+        except Exception:
+            continue
 
-                    profile_data["summary"] = snippet
-                    
-                    loc_m = re.search(r"Location:\s*([^·\n]+)", snippet)
-                    if loc_m: profile_data["location"] = loc_m.group(1).strip()
-                    
-                    exp_m = re.search(r"Experience:\s*([^·\n]+)", snippet)
-                    if exp_m:
-                        profile_data["experiences"].append({"company": exp_m.group(1).strip()})
-                    break
-        except Exception as e:
-            print(f"    [X] Search error: {e}")
+    # Combine and parse all snippets for full historical mentions
+    combined_snippet = " \n ".join(all_snippets)
 
-    # Save to disk & Print directly in Terminal
+    if combined_snippet:
+        # Extract Connections
+        conn_m = re.search(r"(\d+\+?\s*connections)", combined_snippet, re.IGNORECASE)
+        if conn_m:
+            profile_data["connections"] = conn_m.group(1).strip()
+
+        # Extract Location
+        loc_m = re.search(r"(?:Location|based in)[:\s]+([^·\n]+)", combined_snippet, re.IGNORECASE)
+        if loc_m:
+            profile_data["location"] = loc_m.group(1).strip()
+
+        # Extract Experience list
+        exp_matches = re.findall(r"(?:Experience|Current|Past)[:\s]+([^·\n]+)", combined_snippet, re.IGNORECASE)
+        for exp in exp_matches:
+            # Handle comma-separated companies in snippet
+            for sub_exp in re.split(r",\s*|;\s*", exp):
+                sub_clean = sub_exp.strip()
+                if sub_clean and sub_clean not in detected_companies:
+                    detected_companies.append(sub_clean)
+
+        # Extract Education list
+        edu_matches = re.findall(r"(?:Education)[:\s]+([^·\n]+)", combined_snippet, re.IGNORECASE)
+        for edu in edu_matches:
+            for sub_edu in re.split(r",\s*|;\s*", edu):
+                if sub_edu.strip() and sub_edu.strip() not in profile_data["educations"]:
+                    profile_data["educations"].append(sub_edu.strip())
+
+        # Clean bio snippet
+        clean_bio = re.sub(r"^[A-Za-z]+\s+\d{1,2},\s+\d{4}\s*-\s*", "", combined_snippet)
+        clean_bio = re.sub(r"·\s*(?:Experience|Location|connections|Education|View).*$", "", clean_bio, flags=re.IGNORECASE).strip()
+        profile_data["about_snippet"] = clean_bio
+
+    # Auto-resolve LinkedIn URLs for all detected companies
+    resolved_companies = []
+    for comp in detected_companies:
+        comp_info = resolve_company_url(ddgs, comp)
+        resolved_companies.append(comp_info)
+
+    if resolved_companies:
+        profile_data["current_company"] = resolved_companies[0]
+        profile_data["past_companies"] = resolved_companies[1:]
+
+    # Save to disk
     (OUTPUT_DIR / f"{slug}_data.json").write_text(json.dumps(profile_data, indent=2), encoding="utf-8")
+    
+    # 1. Print full raw data directly in Terminal
     print_terminal_result(profile_data)
     
-    # Write to GitHub Actions UI Summary
-    write_to_summary(f"### 👤 Profile: `{profile_data.get('name', clean_id)}`\n"
-                     f"- **URL:** [{linkedin_url}]({linkedin_url})\n"
+    # 2. Write to GitHub Summary UI
+    curr_comp_text = f"[{profile_data['current_company']['name']}]({profile_data['current_company']['company_linkedin_url']})" if profile_data['current_company'] and profile_data['current_company'].get('company_linkedin_url') else (profile_data['current_company']['name'] if profile_data['current_company'] else 'N/A')
+    
+    write_to_summary(f"### 👤 Profile: `{profile_data.get('name')}`\n"
+                     f"- **Profile URL:** [{linkedin_url}]({linkedin_url})\n"
                      f"- **Headline:** {profile_data.get('headline') or 'N/A'}\n"
+                     f"- **Current Company:** {curr_comp_text}\n"
                      f"- **Location:** {profile_data.get('location') or 'N/A'}\n"
+                     f"- **Connections:** {profile_data.get('connections') or 'N/A'}\n"
                      f"```json\n{json.dumps(profile_data, indent=2)}\n```")
 
+    return profile_data
+
 # ----------------------------------------------------------------------
-# COMPANY SCRAPER (Playwright Direct - 100% Working)
+# 2. COMPANY SCRAPER (Playwright Direct Mode - Full Raw Data)
 # ----------------------------------------------------------------------
 def scrape_company(clean_id: str, url: str, slug: str):
     from playwright.sync_api import sync_playwright
@@ -199,7 +222,13 @@ def scrape_company(clean_id: str, url: str, slug: str):
         "url": url,
         "title": "",
         "headline": "",
-        "schema_data": []
+        "about": "",
+        "website": "",
+        "industry": "",
+        "company_size": "",
+        "headquarters": "",
+        "schema_raw_data": [],
+        "raw_page_text": ""
     }
 
     with sync_playwright() as p:
@@ -213,23 +242,31 @@ def scrape_company(clean_id: str, url: str, slug: str):
         page.goto(url, wait_until="domcontentloaded", timeout=45000)
         time.sleep(2)
 
-        (OUTPUT_DIR / f"{slug}_raw.html").write_text(page.content(), encoding="utf-8")
+        raw_html = page.content()
+        (OUTPUT_DIR / f"{slug}_raw.html").write_text(raw_html, encoding="utf-8")
+        
+        company_data["raw_page_text"] = page.inner_text("body")
 
         if page.locator("h1").count() > 0:
             company_data["title"] = page.locator("h1").first.inner_text().strip()
         if page.locator(".top-card-layout__headline").count() > 0:
             company_data["headline"] = page.locator(".top-card-layout__headline").first.inner_text().strip()
+        if page.locator('[data-test-id="about-us__description"]').count() > 0:
+            company_data["about"] = page.locator('[data-test-id="about-us__description"]').first.inner_text().strip()
 
+        # Extract Schema JSON-LD
         json_ld_scripts = page.locator('script[type="application/ld+json"]').all_inner_texts()
         for s in json_ld_scripts:
             try:
-                company_data["schema_data"].append(json.loads(s))
+                company_data["schema_raw_data"].append(json.loads(s))
             except Exception:
                 pass
 
         browser.close()
 
     (OUTPUT_DIR / f"{slug}_data.json").write_text(json.dumps(company_data, indent=2), encoding="utf-8")
+    
+    # Print full raw data to Terminal
     print_terminal_result(company_data)
     
     write_to_summary(f"### 🏢 Company: `{company_data.get('title') or clean_id}`\n"
@@ -237,12 +274,15 @@ def scrape_company(clean_id: str, url: str, slug: str):
                      f"- **Headline:** {company_data.get('headline') or 'N/A'}\n"
                      f"```json\n{json.dumps(company_data, indent=2)}\n```")
 
+# ----------------------------------------------------------------------
+# TERMINAL OUTPUT FORMATTER
+# ----------------------------------------------------------------------
 def print_terminal_result(data: dict):
-    print("\n" + "=" * 65)
-    print(f" 🎯 EXTRACTED RESULT: {data.get('url')}")
-    print("=" * 65)
+    print("\n" + "=" * 70)
+    print(f" 🎯 RAW & STRUCTURED EXTRACTED DATA: {data.get('url')}")
+    print("=" * 70)
     print(json.dumps(data, indent=2, ensure_ascii=False))
-    print("=" * 65 + "\n")
+    print("=" * 70 + "\n")
 
 def main():
     targets = get_targets()
@@ -260,7 +300,7 @@ def main():
 
         time.sleep(1)
 
-    print("[+] All tasks completed.")
+    print("[+] All scraping tasks completed.")
 
 if __name__ == "__main__":
     main()
