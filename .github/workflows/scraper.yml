@@ -1,12 +1,12 @@
-name: LinkedIn Guest Scraper
+name: LinkedIn Cookie-Free Scraper
 
 on:
   workflow_dispatch:
     inputs:
       target_ids:
-        description: 'Enter LinkedIn IDs or URLs (separated by comma or newline)'
+        description: 'Enter LinkedIn IDs or URLs (e.g. company/tigihr, in/iamrohanpatel)'
         required: true
-        default: 'company/tigihr, in/satyanadella'
+        default: 'company/tigihr, in/iamrohanpatel, in/satyanadella'
         type: string
 
 jobs:
