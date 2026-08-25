@@ -53,84 +53,147 @@ def get_targets() -> list[tuple[str, str, str]]:
     ]
 
 # ----------------------------------------------------------------------
-# 1. PROFILE SCRAPER (Via Direct Search Index - No Authwall / No 999)
+# 1. PROFILE SCRAPER (Multi-Engine Search Cascade with Ad-Filtering)
 # ----------------------------------------------------------------------
-def scrape_profile_search_index(page, clean_id: str, linkedin_url: str, slug: str) -> dict:
-    print(f"[*] Extracting profile data via search index for: {clean_id}")
-    
-    profile_data = {
+def parse_profile_snippet(raw_title: str, raw_snippet: str, clean_id: str, linkedin_url: str) -> dict:
+    """Parses raw search engine title and snippet into clean structured profile data."""
+    data = {
         "id": clean_id,
         "type": "profile",
         "url": linkedin_url,
         "name": clean_id,
         "headline": "",
+        "current_company_or_role": "",
         "location": "",
-        "summary": "",
-        "raw_title": "",
-        "raw_snippet": ""
+        "education": "",
+        "summary": raw_snippet,
+        "raw_title": raw_title,
+        "raw_snippet": raw_snippet
     }
 
-    # Query 1: DuckDuckGo HTML
-    query = f"site:linkedin.com/in/{clean_id}"
-    ddg_url = f"https://html.duckduckgo.com/html/?q={urllib.parse.quote(query)}"
+    # Clean title (removes LinkedIn suffix)
+    cleaned_title = re.sub(r"\s*[-|]\s*LinkedIn.*$", "", raw_title, flags=re.IGNORECASE).strip()
     
-    success = False
-    try:
-        page.goto(ddg_url, wait_until="domcontentloaded", timeout=25000)
-        time.sleep(2)
-        
-        first_result = page.locator(".result__body").first
-        if first_result.count() > 0:
-            title = first_result.locator(".result__title").inner_text().strip()
-            snippet = first_result.locator(".result__snippet").inner_text().strip()
-            
-            profile_data["raw_title"] = title
-            profile_data["raw_snippet"] = snippet
-            success = True
-    except Exception as e:
-        print(f"    [!] DuckDuckGo query skipped: {e}")
+    # Title format typically: "Name - Headline - Company" or "Name - Headline"
+    if " - " in cleaned_title:
+        parts = [p.strip() for p in cleaned_title.split(" - ") if p.strip()]
+        data["name"] = parts[0]
+        data["headline"] = " - ".join(parts[1:])
+        if len(parts) >= 3:
+            data["current_company_or_role"] = parts[-1]
+    elif cleaned_title:
+        data["name"] = cleaned_title
 
-    # Query 2: Bing fallback if needed
-    if not success or not profile_data["raw_title"]:
+    # Extract Location
+    loc_match = re.search(r"(?:Location|Location:)\s*([^·\n]+)", raw_snippet, re.IGNORECASE)
+    if loc_match:
+        data["location"] = loc_match.group(1).strip()
+
+    # Extract Experience / Current Role
+    exp_match = re.search(r"(?:Experience|Current)[:\s]+([^·\n]+)", raw_snippet, re.IGNORECASE)
+    if exp_match:
+        data["current_company_or_role"] = exp_match.group(1).strip()
+
+    # Extract Education
+    edu_match = re.search(r"(?:Education)[:\s]+([^·\n]+)", raw_snippet, re.IGNORECASE)
+    if edu_match:
+        data["education"] = edu_match.group(1).strip()
+
+    return data
+
+def scrape_profile_search_index(page, clean_id: str, linkedin_url: str, slug: str) -> dict:
+    print(f"[*] Extracting organic profile data for: {clean_id}")
+    query = f"site:linkedin.com/in/{clean_id}"
+    
+    raw_title = ""
+    raw_snippet = ""
+    found_engine = None
+
+    # ENGINE 1: Google Search
+    try:
+        google_url = f"https://www.google.com/search?q={urllib.parse.quote(query)}&hl=en"
+        page.goto(google_url, wait_until="domcontentloaded", timeout=20000)
+        time.sleep(1.5)
+        
+        # Check for Google Consent modal
+        consent_btn = page.locator('button:has-text("Accept all"), button:has-text("I agree"), button:has-text("Stay signed out")')
+        if consent_btn.count() > 0:
+            consent_btn.first.click()
+            time.sleep(1)
+
+        # Look strictly for organic LinkedIn result links
+        organic_cards = page.locator('#search .g, div[data-sokoban-container]').all()
+        for card in organic_cards:
+            link = card.locator('a[href*="linkedin.com/in/"]').first
+            if link.count() > 0:
+                h3 = card.locator('h3').first
+                snippet_el = card.locator('div[style*="-webkit-line-clamp"], .VwiC3b').first
+                if h3.count() > 0:
+                    raw_title = h3.inner_text().strip()
+                    raw_snippet = snippet_el.inner_text().strip() if snippet_el.count() > 0 else ""
+                    found_engine = "Google"
+                    break
+    except Exception as e:
+        print(f"    [!] Google query skipped: {e}")
+
+    # ENGINE 2: Bing Search (Fallback)
+    if not raw_title:
         try:
-            bing_url = f"https://www.bing.com/search?q={urllib.parse.quote(query)}"
-            page.goto(bing_url, wait_until="domcontentloaded", timeout=25000)
-            time.sleep(2)
-            
-            first_algo = page.locator("#b_results .b_algo").first
-            if first_algo.count() > 0:
-                title = first_algo.locator("h2").inner_text().strip()
-                snippet = first_algo.locator(".b_caption p").inner_text().strip()
-                
-                profile_data["raw_title"] = title
-                profile_data["raw_snippet"] = snippet
-                success = True
+            bing_url = f"https://www.bing.com/search?q={urllib.parse.quote(query)}&setlang=en"
+            page.goto(bing_url, wait_until="domcontentloaded", timeout=20000)
+            time.sleep(1.5)
+
+            algo_cards = page.locator('#b_results .b_algo').all()
+            for card in algo_cards:
+                link = card.locator('a[href*="linkedin.com/in/"]').first
+                if link.count() > 0:
+                    h2 = card.locator('h2').first
+                    caption = card.locator('.b_caption p').first
+                    if h2.count() > 0:
+                        raw_title = h2.inner_text().strip()
+                        raw_snippet = caption.inner_text().strip() if caption.count() > 0 else ""
+                        found_engine = "Bing"
+                        break
         except Exception as e:
             print(f"    [!] Bing fallback skipped: {e}")
 
-    # Parse title into Name & Headline
-    # Format typically: "Satya Nadella - Chairman and Chief Executive Officer - Microsoft | LinkedIn"
-    raw_title = profile_data["raw_title"].replace(" | LinkedIn", "").replace(" - LinkedIn", "").strip()
-    if " - " in raw_title:
-        parts = [p.strip() for p in raw_title.split(" - ") if p.strip()]
-        profile_data["name"] = parts[0]
-        profile_data["headline"] = " - ".join(parts[1:])
-    elif raw_title:
-        profile_data["name"] = raw_title
+    # ENGINE 3: DuckDuckGo (Fallback with strict ad exclusion)
+    if not raw_title:
+        try:
+            ddg_url = f"https://html.duckduckgo.com/html/?q={urllib.parse.quote(query)}"
+            page.goto(ddg_url, wait_until="domcontentloaded", timeout=20000)
+            time.sleep(1.5)
 
-    # Extract summary/location from snippet
-    raw_snippet = profile_data["raw_snippet"]
-    profile_data["summary"] = raw_snippet
-    
-    loc_match = re.search(r"Location:\s*([^·\n]+)", raw_snippet, re.IGNORECASE)
-    if loc_match:
-        profile_data["location"] = loc_match.group(1).strip()
+            results = page.locator('.result:not(.result--ad)').all()
+            for res_el in results:
+                link = res_el.locator('a[href*="linkedin.com/in/"], a.result__url[href*="linkedin.com/in"]').first
+                if link.count() > 0:
+                    t_el = res_el.locator('.result__title').first
+                    s_el = res_el.locator('.result__snippet').first
+                    if t_el.count() > 0:
+                        raw_title = t_el.inner_text().strip()
+                        raw_snippet = s_el.inner_text().strip() if s_el.count() > 0 else ""
+                        found_engine = "DuckDuckGo"
+                        break
+        except Exception as e:
+            print(f"    [!] DuckDuckGo fallback skipped: {e}")
 
-    # Save output files
+    # Parse extracted strings
+    profile_data = parse_profile_snippet(raw_title, raw_snippet, clean_id, linkedin_url)
+    profile_data["search_engine_source"] = found_engine or "None"
+
+    # Save output
     (OUTPUT_DIR / f"{slug}_data.json").write_text(json.dumps(profile_data, indent=2), encoding="utf-8")
-    (OUTPUT_DIR / f"{slug}_raw.txt").write_text(f"Title: {profile_data['raw_title']}\nSnippet: {profile_data['raw_snippet']}", encoding="utf-8")
+    (OUTPUT_DIR / f"{slug}_raw.txt").write_text(
+        f"Name: {profile_data['name']}\nHeadline: {profile_data['headline']}\nLocation: {profile_data['location']}\nSummary: {profile_data['summary']}\n",
+        encoding="utf-8"
+    )
 
-    print(f"    [✓] Extracted: Name: '{profile_data['name']}' | Headline: '{profile_data['headline']}'")
+    if found_engine:
+        print(f"    [✓] Extracted via {found_engine}: Name='{profile_data['name']}' | Headline='{profile_data['headline']}'")
+    else:
+        print(f"    [!] Warning: No organic search record found for ID '{clean_id}'. Saved placeholder entry.")
+
     return profile_data
 
 # ----------------------------------------------------------------------
@@ -168,7 +231,7 @@ def scrape_company_direct(page, clean_id: str, url: str, slug: str):
         print(f"    [X] Error scraping company {url}: {e}")
 
 # ----------------------------------------------------------------------
-# MAIN EXECUTION
+# MAIN RUNNER
 # ----------------------------------------------------------------------
 def main():
     targets = get_targets()
