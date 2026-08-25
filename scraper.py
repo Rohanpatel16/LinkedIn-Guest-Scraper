@@ -3,8 +3,8 @@ import re
 import sys
 import json
 import time
-import urllib.parse
 from pathlib import Path
+from duckduckgo_search import DDGS
 from playwright.sync_api import sync_playwright
 
 OUTPUT_DIR = Path("output")
@@ -53,11 +53,12 @@ def get_targets() -> list[tuple[str, str, str]]:
     ]
 
 # ----------------------------------------------------------------------
-# 1. PROFILE SCRAPER (Multi-Engine Search Cascade with Ad-Filtering)
+# 1. PROFILE EXTRACTION (Via Direct API - Zero Ads, Zero Cookies)
 # ----------------------------------------------------------------------
-def parse_profile_snippet(raw_title: str, raw_snippet: str, clean_id: str, linkedin_url: str) -> dict:
-    """Parses raw search engine title and snippet into clean structured profile data."""
-    data = {
+def scrape_profile_api(clean_id: str, linkedin_url: str, slug: str) -> dict:
+    print(f"[*] Fetching Profile via Search API for: {clean_id}")
+    
+    profile_data = {
         "id": clean_id,
         "type": "profile",
         "url": linkedin_url,
@@ -65,153 +66,89 @@ def parse_profile_snippet(raw_title: str, raw_snippet: str, clean_id: str, linke
         "headline": "",
         "current_company_or_role": "",
         "location": "",
-        "education": "",
-        "summary": raw_snippet,
-        "raw_title": raw_title,
-        "raw_snippet": raw_snippet
+        "summary": "",
+        "raw_title": "",
+        "raw_snippet": ""
     }
 
-    # Clean title (removes LinkedIn suffix)
-    cleaned_title = re.sub(r"\s*[-|]\s*LinkedIn.*$", "", raw_title, flags=re.IGNORECASE).strip()
-    
-    # Title format typically: "Name - Headline - Company" or "Name - Headline"
-    if " - " in cleaned_title:
-        parts = [p.strip() for p in cleaned_title.split(" - ") if p.strip()]
-        data["name"] = parts[0]
-        data["headline"] = " - ".join(parts[1:])
-        if len(parts) >= 3:
-            data["current_company_or_role"] = parts[-1]
-    elif cleaned_title:
-        data["name"] = cleaned_title
-
-    # Extract Location
-    loc_match = re.search(r"(?:Location|Location:)\s*([^·\n]+)", raw_snippet, re.IGNORECASE)
-    if loc_match:
-        data["location"] = loc_match.group(1).strip()
-
-    # Extract Experience / Current Role
-    exp_match = re.search(r"(?:Experience|Current)[:\s]+([^·\n]+)", raw_snippet, re.IGNORECASE)
-    if exp_match:
-        data["current_company_or_role"] = exp_match.group(1).strip()
-
-    # Extract Education
-    edu_match = re.search(r"(?:Education)[:\s]+([^·\n]+)", raw_snippet, re.IGNORECASE)
-    if edu_match:
-        data["education"] = edu_match.group(1).strip()
-
-    return data
-
-def scrape_profile_search_index(page, clean_id: str, linkedin_url: str, slug: str) -> dict:
-    print(f"[*] Extracting organic profile data for: {clean_id}")
-    query = f"site:linkedin.com/in/{clean_id}"
-    
-    raw_title = ""
-    raw_snippet = ""
-    found_engine = None
-
-    # ENGINE 1: Google Search
     try:
-        google_url = f"https://www.google.com/search?q={urllib.parse.quote(query)}&hl=en"
-        page.goto(google_url, wait_until="domcontentloaded", timeout=20000)
-        time.sleep(1.5)
-        
-        # Check for Google Consent modal
-        consent_btn = page.locator('button:has-text("Accept all"), button:has-text("I agree"), button:has-text("Stay signed out")')
-        if consent_btn.count() > 0:
-            consent_btn.first.click()
-            time.sleep(1)
+        ddgs = DDGS()
+        # Query specifically for this LinkedIn handle
+        queries = [
+            f"site:linkedin.com/in/{clean_id}",
+            f'"{clean_id}" site:linkedin.com/in',
+            f"{clean_id} linkedin profile"
+        ]
 
-        # Look strictly for organic LinkedIn result links
-        organic_cards = page.locator('#search .g, div[data-sokoban-container]').all()
-        for card in organic_cards:
-            link = card.locator('a[href*="linkedin.com/in/"]').first
-            if link.count() > 0:
-                h3 = card.locator('h3').first
-                snippet_el = card.locator('div[style*="-webkit-line-clamp"], .VwiC3b').first
-                if h3.count() > 0:
-                    raw_title = h3.inner_text().strip()
-                    raw_snippet = snippet_el.inner_text().strip() if snippet_el.count() > 0 else ""
-                    found_engine = "Google"
+        found_result = None
+        for q in queries:
+            results = list(ddgs.text(q, max_results=5))
+            for res in results:
+                href = res.get("href", "")
+                if "linkedin.com/in/" in href:
+                    found_result = res
                     break
+            if found_result:
+                break
+
+        if found_result:
+            raw_title = found_result.get("title", "")
+            raw_snippet = found_result.get("body", "")
+
+            profile_data["raw_title"] = raw_title
+            profile_data["raw_snippet"] = raw_snippet
+            profile_data["summary"] = raw_snippet
+
+            # Parse title: "Name - Headline - Company | LinkedIn"
+            cleaned_title = re.sub(r"\s*[-|]\s*LinkedIn.*$", "", raw_title, flags=re.IGNORECASE).strip()
+            if " - " in cleaned_title:
+                parts = [p.strip() for p in cleaned_title.split(" - ") if p.strip()]
+                profile_data["name"] = parts[0]
+                profile_data["headline"] = " - ".join(parts[1:])
+                if len(parts) >= 3:
+                    profile_data["current_company_or_role"] = parts[-1]
+            elif cleaned_title:
+                profile_data["name"] = cleaned_title
+
+            # Parse Location and Experience from snippet
+            loc_match = re.search(r"(?:Location|based in)[:\s]+([^·\n]+)", raw_snippet, re.IGNORECASE)
+            if loc_match:
+                profile_data["location"] = loc_match.group(1).strip()
+
+            exp_match = re.search(r"(?:Experience|Current)[:\s]+([^·\n]+)", raw_snippet, re.IGNORECASE)
+            if exp_match:
+                profile_data["current_company_or_role"] = exp_match.group(1).strip()
+
+            print(f"    [✓] Extracted: Name='{profile_data['name']}' | Headline='{profile_data['headline']}'")
+        else:
+            print(f"    [!] No public record found on search index for '{clean_id}'")
+
     except Exception as e:
-        print(f"    [!] Google query skipped: {e}")
+        print(f"    [X] Search API Error: {e}")
 
-    # ENGINE 2: Bing Search (Fallback)
-    if not raw_title:
-        try:
-            bing_url = f"https://www.bing.com/search?q={urllib.parse.quote(query)}&setlang=en"
-            page.goto(bing_url, wait_until="domcontentloaded", timeout=20000)
-            time.sleep(1.5)
-
-            algo_cards = page.locator('#b_results .b_algo').all()
-            for card in algo_cards:
-                link = card.locator('a[href*="linkedin.com/in/"]').first
-                if link.count() > 0:
-                    h2 = card.locator('h2').first
-                    caption = card.locator('.b_caption p').first
-                    if h2.count() > 0:
-                        raw_title = h2.inner_text().strip()
-                        raw_snippet = caption.inner_text().strip() if caption.count() > 0 else ""
-                        found_engine = "Bing"
-                        break
-        except Exception as e:
-            print(f"    [!] Bing fallback skipped: {e}")
-
-    # ENGINE 3: DuckDuckGo (Fallback with strict ad exclusion)
-    if not raw_title:
-        try:
-            ddg_url = f"https://html.duckduckgo.com/html/?q={urllib.parse.quote(query)}"
-            page.goto(ddg_url, wait_until="domcontentloaded", timeout=20000)
-            time.sleep(1.5)
-
-            results = page.locator('.result:not(.result--ad)').all()
-            for res_el in results:
-                link = res_el.locator('a[href*="linkedin.com/in/"], a.result__url[href*="linkedin.com/in"]').first
-                if link.count() > 0:
-                    t_el = res_el.locator('.result__title').first
-                    s_el = res_el.locator('.result__snippet').first
-                    if t_el.count() > 0:
-                        raw_title = t_el.inner_text().strip()
-                        raw_snippet = s_el.inner_text().strip() if s_el.count() > 0 else ""
-                        found_engine = "DuckDuckGo"
-                        break
-        except Exception as e:
-            print(f"    [!] DuckDuckGo fallback skipped: {e}")
-
-    # Parse extracted strings
-    profile_data = parse_profile_snippet(raw_title, raw_snippet, clean_id, linkedin_url)
-    profile_data["search_engine_source"] = found_engine or "None"
-
-    # Save output
+    # Save outputs
     (OUTPUT_DIR / f"{slug}_data.json").write_text(json.dumps(profile_data, indent=2), encoding="utf-8")
     (OUTPUT_DIR / f"{slug}_raw.txt").write_text(
-        f"Name: {profile_data['name']}\nHeadline: {profile_data['headline']}\nLocation: {profile_data['location']}\nSummary: {profile_data['summary']}\n",
+        f"Title: {profile_data['raw_title']}\nSnippet: {profile_data['raw_snippet']}\n",
         encoding="utf-8"
     )
-
-    if found_engine:
-        print(f"    [✓] Extracted via {found_engine}: Name='{profile_data['name']}' | Headline='{profile_data['headline']}'")
-    else:
-        print(f"    [!] Warning: No organic search record found for ID '{clean_id}'. Saved placeholder entry.")
 
     return profile_data
 
 # ----------------------------------------------------------------------
-# 2. COMPANY SCRAPER (Direct Playwright - 100% Success)
+# 2. COMPANY SCRAPER (Playwright Direct - 100% Working)
 # ----------------------------------------------------------------------
 def scrape_company_direct(page, clean_id: str, url: str, slug: str):
     print(f"[*] Scraping Company directly: {url}")
     try:
-        response = page.goto(url, wait_until="domcontentloaded", timeout=45000)
+        page.goto(url, wait_until="domcontentloaded", timeout=45000)
         time.sleep(2)
 
-        # Save Raw HTML, Text, and Screenshot
         html_content = page.content()
         (OUTPUT_DIR / f"{slug}_raw.html").write_text(html_content, encoding="utf-8")
         (OUTPUT_DIR / f"{slug}_raw.txt").write_text(page.inner_text("body"), encoding="utf-8")
         page.screenshot(path=str(OUTPUT_DIR / f"{slug}.png"), full_page=False)
 
-        # Extract Schema JSON-LD
         json_ld_scripts = page.locator('script[type="application/ld+json"]').all_inner_texts()
         extracted_data = []
         for s in json_ld_scripts:
@@ -235,12 +172,20 @@ def scrape_company_direct(page, clean_id: str, url: str, slug: str):
 # ----------------------------------------------------------------------
 def main():
     targets = get_targets()
-    print(f"[*] Total targets to scrape: {len(targets)}")
+    print(f"[*] Total targets: {len(targets)}")
     for t_type, clean_id, url in targets:
         print(f"  - [{t_type.upper()}] {url}")
 
-    with sync_playwright() as p:
-        browser = p.chromium.launch(
+    # Launch Playwright only if there are company targets
+    has_companies = any(t[0] == "company" for t in targets)
+    
+    browser = None
+    page = None
+    playwright_instance = None
+
+    if has_companies:
+        playwright_instance = sync_playwright().start()
+        browser = playwright_instance.chromium.launch(
             headless=True,
             args=["--disable-blink-features=AutomationControlled", "--no-sandbox", "--disable-dev-shm-usage"]
         )
@@ -252,20 +197,22 @@ def main():
         )
         page = context.new_page()
 
-        for idx, (t_type, clean_id, url) in enumerate(targets, start=1):
-            slug = sanitize_filename(url)
-            print(f"\n[{idx}/{len(targets)}] Scraping [{t_type.upper()}]: {clean_id}")
+    for idx, (t_type, clean_id, url) in enumerate(targets, start=1):
+        slug = sanitize_filename(url)
+        print(f"\n[{idx}/{len(targets)}] Scraping [{t_type.upper()}]: {clean_id}")
 
-            if t_type == "profile":
-                scrape_profile_search_index(page, clean_id, url, slug)
-            else:
-                scrape_company_direct(page, clean_id, url, slug)
+        if t_type == "profile":
+            scrape_profile_api(clean_id, url, slug)
+        else:
+            scrape_company_direct(page, clean_id, url, slug)
 
-            time.sleep(2)
+        time.sleep(1.5)
 
+    if browser:
         browser.close()
+        playwright_instance.stop()
 
-    print("\n[+] Scraping complete! Files saved in 'output/' folder.")
+    print("\n[+] Done! Output files saved in 'output/' directory.")
 
 if __name__ == "__main__":
     main()
